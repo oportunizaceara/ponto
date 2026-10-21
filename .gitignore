@@ -1,0 +1,5 @@
+backup-*.json
+*.xlsx
+Thumbs.db
+desktop.ini
+.DS_Store
