@@ -237,7 +237,6 @@ button:disabled{opacity:.42;cursor:not-allowed;filter:none}
 .bank-item span{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
 .bank-item strong{font-family:var(--serif);font-size:22px;font-weight:400;letter-spacing:-.03em}
 .days-grid{display:flex;flex-wrap:wrap;gap:10px 14px;padding-top:4px}
-.storage-note{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.4}
 .sync-dot{font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;padding:0 8px;white-space:nowrap}
 .sync-dot.ok{color:var(--good)}
 .sync-dot.wait{color:var(--warn)}
@@ -342,8 +341,6 @@ body.view-projects .project-switch{display:none !important}
           <label class="check"><input type="checkbox" id="rememberLogin"> Lembrar login</label>
         </div>
         <button type="button" id="loginBtn" style="width:100%;margin-top:8px">Entrar</button>
-        <div class="hint">Gestor e funcionário entram com CPF e senha. Depois de bater o ponto, só o gestor corrige.</div>
-        <p class="storage-note">Os lançamentos são sincronizados em tempo real pelo Firebase (Realtime e Firestore) em todos os dispositivos. O login por CPF continua neste aplicativo. Abra o arquivo por http://, não por file://.</p>
       </div>
     </div>
   </section>
@@ -672,6 +669,7 @@ body.view-projects .project-switch{display:none !important}
 <script>
 (function(){
   const KEY="controle_horas_assistentes_v2";
+  const BACKUP_KEY="controle_horas_assistentes_v2_backup";
   const KEY_V1="controle_horas_assistentes_v1";
   const SESSION_KEY="controle_horas_sessao_v1";
   const PREF_KEY="controle_horas_prefs_v1";
@@ -790,9 +788,10 @@ body.view-projects .project-switch{display:none !important}
   function normalize(raw){
     raw=raw||{};
     let projects;
-    if(Array.isArray(raw.projects)&&raw.projects.length){
+    const incoming=asArray(raw.projects).filter(p=>p&&(p.id||p.employees||p.name));
+    if(incoming.length){
       projects=PROJECT_DEFS.map(def=>{
-        const src=raw.projects.find(p=>p&&p.id===def.id)||{};
+        const src=incoming.find(p=>p&&p.id===def.id)||{};
         return defaultProject(def, src);
       });
     } else {
@@ -817,7 +816,8 @@ body.view-projects .project-switch{display:none !important}
     });
     const auth=Object.assign({managerHash:"", cpf:""}, raw.auth||{});
     auth.cpf=digitsCpf(auth.cpf);
-    const meta=Object.assign({updatedAt:"", createdAt:raw.meta&&raw.meta.createdAt||""}, raw.meta||{});
+    const meta=Object.assign({updatedAt:"", createdAt:raw.meta&&raw.meta.createdAt||"", rev:0}, raw.meta||{});
+    meta.rev=Number(meta.rev)||0;
     projects.forEach(p=>p.employees.forEach(e=>{
       if(!Array.isArray(e.workDays)||!e.workDays.length) e.workDays=[1,2,3,4,5];
       e.workDays=e.workDays.map(Number).filter(d=>d>=0&&d<=6);
@@ -825,19 +825,32 @@ body.view-projects .project-switch{display:none !important}
     return {projects:projects, records:records, closures:closures, history:history, alerts:asArray(raw.alerts).slice(0,80), auth:auth, meta:meta, holidays:asArray(raw.holidays)};
   }
   let needsFirstPersist=false;
-  function load(){
+  function readStored(key){
     try{
-      const v2=localStorage.getItem(KEY);
-      if(v2) return normalize(JSON.parse(v2));
-      const v1=localStorage.getItem(KEY_V1);
-      if(v1){
-        const old=JSON.parse(v1)||{};
-        needsFirstPersist=true;
-        return normalize({names:old.names, records:old.records});
+      const raw=localStorage.getItem(key);
+      if(!raw) return null;
+      return normalize(JSON.parse(raw));
+    }catch(e){ return null; }
+  }
+  function load(){
+    let primary=null;
+    let fromLegacy=false;
+    try{
+      if(localStorage.getItem(KEY)) primary=readStored(KEY);
+      else if(localStorage.getItem(KEY_V1)){
+        const old=JSON.parse(localStorage.getItem(KEY_V1))||{};
+        primary=normalize({names:old.names, records:old.records});
+        fromLegacy=true;
       }
     }catch(e){}
-    needsFirstPersist=true;
-    return normalize(null);
+    const backup=readStored(BACKUP_KEY);
+    const chosen=pickSaved(primary, backup);
+    if(!chosen){
+      needsFirstPersist=true;
+      return normalize(null);
+    }
+    if(fromLegacy||chosen!==primary) needsFirstPersist=true;
+    return chosen;
   }
   const FB_CONFIG={
     apiKey:"AIzaSyCXY4k4zWHY5imkioT9RSa0i5FmTFAH4sE",
@@ -852,9 +865,18 @@ body.view-projects .project-switch{display:none !important}
   let cloudReady=false;
   let cloudIgnore=false;
   let cloudListening=false;
+  let cloudHydrated=false;
+  let pushQueued=false;
+  let cloudErrorShown=false;
   let lastPushAt="";
+  let lastPushRev=0;
+  let pushSerial=0;
+  let pushChain=Promise.resolve();
   let rtdbRef=null;
   let fsDoc=null;
+  let rtdbSeen=false;
+  let fsHeld=null;
+  let fsHeldSeen=false;
   function setSyncStatus(kind, detail){
     const labels={
       syncStatus:{ok:"Nuvem", err:"Nuvem off", wait:"Nuvem…"},
@@ -868,32 +890,110 @@ body.view-projects .project-switch{display:none !important}
       el.textContent=labels[id][kind]||labels[id].wait;
     });
   }
+  function recordCount(s){
+    let n=0;
+    const recs=(s&&s.records)||{};
+    Object.keys(recs).forEach(k=>{ n+=asArray(recs[k]).length; });
+    return n;
+  }
+  function identityCount(s){
+    let n=0;
+    if(s&&s.auth&&(s.auth.cpf||s.auth.managerHash)) n++;
+    (s&&s.projects||[]).forEach(p=>(p.employees||[]).forEach(e=>{
+      if(!e) return;
+      if(e.name && !/^Assistente \d+$/.test(e.name)) n++;
+      if(e.cpf||e.passHash||e.pinHash) n++;
+    }));
+    return n;
+  }
+  function stateScore(s){
+    if(!s) return 0;
+    return recordCount(s)*5+((s.history||[]).length)+identityCount(s)*6+Object.keys(s.closures||{}).length+((s.alerts||[]).length);
+  }
+  function customNameCount(s){
+    let n=0;
+    (s&&s.projects||[]).forEach(p=>(p.employees||[]).forEach(e=>{
+      if(e&&e.name && !/^Assistente \d+$/.test(e.name)) n++;
+    }));
+    return n;
+  }
+  function cpfCount(s){
+    let n=0;
+    if(s&&s.auth&&s.auth.cpf) n++;
+    (s&&s.projects||[]).forEach(p=>(p.employees||[]).forEach(e=>{ if(e&&e.cpf) n++; }));
+    return n;
+  }
+  function lostWork(kept, dropped){
+    if(!kept||!dropped) return false;
+    if(recordCount(kept)>recordCount(dropped)) return true;
+    if(customNameCount(kept)>customNameCount(dropped)) return true;
+    if(cpfCount(kept)>cpfCount(dropped)) return true;
+    return false;
+  }
   function isEmptyState(s){
     s=s||state;
-    return !(s&&s.auth&&s.auth.managerHash) && !Object.keys((s&&s.records)||{}).length && !((s&&s.history)||[]).length;
+    return recordCount(s)===0 && !((s&&s.history)||[]).length && identityCount(s)===0;
+  }
+  function remoteWins(localS, remoteS){
+    if(!remoteS) return false;
+    const localEmpty=isEmptyState(localS);
+    const remoteEmpty=isEmptyState(remoteS);
+    if(localEmpty && !remoteEmpty) return true;
+    if(!localEmpty && remoteEmpty) return false;
+    const lr=Number(localS.meta&&localS.meta.rev)||0;
+    const rr=Number(remoteS.meta&&remoteS.meta.rev)||0;
+    if(lr>0 && rr>0 && lr!==rr) return rr>lr;
+    const la=(localS.meta&&localS.meta.updatedAt)||"";
+    const ra=(remoteS.meta&&remoteS.meta.updatedAt)||"";
+    if(ra&&la&&ra!==la) return ra>la;
+    if(ra&&!la) return true;
+    return false;
+  }
+  function pickSaved(primary, backup){
+    if(!backup) return primary;
+    if(!primary) return backup;
+    const pr=Number(primary.meta&&primary.meta.rev)||0;
+    const br=Number(backup.meta&&backup.meta.rev)||0;
+    if(lostWork(backup, primary) && pr<=br) return backup;
+    if(remoteWins(primary, backup)) return backup;
+    if(!remoteWins(backup, primary) && stateScore(backup)>stateScore(primary)) return backup;
+    return primary;
+  }
+  function decodeRemote(remote){
+    if(!remote) return null;
+    let decoded=null;
+    try{
+      if(typeof remote.stateJson==="string" && remote.stateJson) decoded=normalize(JSON.parse(remote.stateJson));
+    }catch(e){ decoded=null; }
+    if(!decoded && remote.state){
+      try{ decoded=normalize(remote.state); }catch(e){ decoded=null; }
+    }
+    if(!decoded) return null;
+    if(remote.updatedAt) decoded.meta.updatedAt=remote.updatedAt;
+    if(typeof remote.rev==="number") decoded.meta.rev=remote.rev;
+    return decoded;
   }
   function cloudEnvelope(){
+    const snapshot=JSON.parse(JSON.stringify(state));
     return {
-      state:JSON.parse(JSON.stringify(state)),
-      updatedAt:state.meta&&state.meta.updatedAt||new Date().toISOString(),
+      stateJson:JSON.stringify(snapshot),
+      state:snapshot,
+      updatedAt:snapshot.meta&&snapshot.meta.updatedAt||new Date().toISOString(),
+      rev:Number(snapshot.meta&&snapshot.meta.rev)||0,
       updatedBy:(window.firebase&&firebase.auth().currentUser&&firebase.auth().currentUser.uid)||"local"
     };
   }
-  function applyCloud(remote, source){
-    if(!remote||!remote.state) return;
-    if(remote.updatedAt && remote.updatedAt===lastPushAt) return;
-    const localAt=(state.meta&&state.meta.updatedAt)||"";
-    const remoteAt=remote.updatedAt||"";
-    if(!isEmptyState(state) && remoteAt && localAt && remoteAt<localAt){
-      pushCloud();
-      return;
-    }
-    if(remoteAt && localAt && remoteAt===localAt) return;
+  function adoptRemote(next, source){
     const prevAlerts=((state.alerts)||[]).map(a=>a.id).join(",");
+    const prevRev=Number(state.meta&&state.meta.rev)||0;
+    const prevScore=stateScore(state);
     cloudIgnore=true;
     try{
-      state=normalize(remote.state);
-      localStorage.setItem(KEY, JSON.stringify(state));
+      state=next;
+      const json=JSON.stringify(state);
+      localStorage.setItem(KEY, json);
+      const nextRev=Number(state.meta&&state.meta.rev)||0;
+      if(nextRev>prevRev || stateScore(state)>=prevScore) localStorage.setItem(BACKUP_KEY, json);
     }catch(e){}
     cloudIgnore=false;
     if(role){
@@ -906,31 +1006,75 @@ body.view-projects .project-switch{display:none !important}
       showLogin();
     }
   }
+  function applyCloud(remote){
+    const decoded=decodeRemote(remote);
+    if(!decoded){
+      if(cloudHydrated && !isEmptyState(state)) pushCloud();
+      return;
+    }
+    const sameEcho=remote.updatedAt && remote.updatedAt===lastPushAt && (Number(remote.rev)||Number(decoded.meta.rev)||0)===(Number(state.meta&&state.meta.rev)||0);
+    if(sameEcho && !lostWork(state, decoded)) return;
+    const newer=remoteWins(state, decoded);
+    const rr=Number(decoded.meta&&decoded.meta.rev)||0;
+    const lr=Number(state.meta&&state.meta.rev)||0;
+    if(!newer || (lostWork(state, decoded) && !(rr>lr))){
+      const la=(state.meta&&state.meta.updatedAt)||"";
+      const ra=(decoded.meta&&decoded.meta.updatedAt)||"";
+      const localNewer=(lr>0&&rr>0&&lr>rr)||(la&&ra&&la>ra)||lostWork(state, decoded);
+      if(cloudHydrated && !isEmptyState(state) && localNewer) pushCloud();
+      return;
+    }
+    adoptRemote(decoded, "nuvem");
+  }
   function pushCloud(){
-    if(!cloudReady||cloudIgnore||typeof firebase==="undefined") return;
+    if(!cloudReady||!cloudHydrated||cloudIgnore||typeof firebase==="undefined") return;
     if(isEmptyState(state)) return;
     const payload=cloudEnvelope();
     lastPushAt=payload.updatedAt;
-    const writes=[];
-    if(rtdbRef) writes.push(rtdbRef.set(payload));
-    if(fsDoc) writes.push(fsDoc.set(payload));
-    Promise.all(writes).then(()=>setSyncStatus("ok","Sincronizado em "+new Date(payload.updatedAt).toLocaleString("pt-BR"))).catch(err=>setSyncStatus("err", err&&err.message||"Falha ao gravar na nuvem"));
+    lastPushRev=payload.rev;
+    const serial=++pushSerial;
+    pushChain=pushChain.then(()=>{
+      if(serial!==pushSerial) return;
+      const writes=[];
+      if(rtdbRef) writes.push(rtdbRef.set(payload));
+      if(fsDoc) writes.push(fsDoc.set(payload));
+      return Promise.all(writes).then(()=>{
+        if(serial!==pushSerial) return;
+        cloudErrorShown=false;
+        setSyncStatus("ok","Sincronizado em "+new Date(payload.updatedAt).toLocaleString("pt-BR"));
+      }).catch(err=>{
+        if(serial!==pushSerial) return;
+        setSyncStatus("err", err&&err.message||"Falha ao gravar na nuvem");
+        if(!cloudErrorShown){
+          cloudErrorShown=true;
+          toast("A nuvem não gravou. Os dados continuam salvos neste navegador.");
+        }
+      });
+    }).catch(()=>{});
   }
   function persist(){
     try{
       if(cloudIgnore) return true;
       state.meta=state.meta||{};
       if(!state.meta.createdAt) state.meta.createdAt=new Date().toISOString();
+      state.meta.rev=(Number(state.meta.rev)||0)+1;
       state.meta.updatedAt=new Date().toISOString();
       const json=JSON.stringify(state);
       localStorage.setItem(KEY, json);
+      localStorage.setItem(BACKUP_KEY, json);
       if(localStorage.getItem(KEY)!==json) throw new Error("o navegador devolveu um conteúdo diferente do gravado");
-      pushCloud();
+      if(cloudHydrated) pushCloud();
+      else pushQueued=true;
       return true;
     }catch(e){
       alert("Não foi possível salvar. "+((e&&e.message)||"O armazenamento do navegador pode estar cheio."));
       return false;
     }
+  }
+  function flushQueuedPush(){
+    if(!pushQueued) return;
+    pushQueued=false;
+    pushCloud();
   }
   function startCloud(){
     if(typeof firebase==="undefined"||!firebase.initializeApp){
@@ -958,20 +1102,33 @@ body.view-projects .project-switch{display:none !important}
         cloudListening=true;
         rtdbRef.on("value", snap=>{
           const remote=snap.val();
-          if(!remote||!remote.state){
-            if(!isEmptyState(state)) pushCloud();
-            else setSyncStatus("ok","Aguardando o primeiro salvamento");
+          if(!rtdbSeen){
+            rtdbSeen=true;
+            cloudHydrated=true;
+            if((!remote||(!remote.state && !remote.stateJson)) && fsHeldSeen && fsHeld) applyCloud(fsHeld);
+            else applyCloud(remote);
+            flushQueuedPush();
+            if(isEmptyState(state)) setSyncStatus("ok","Aguardando o primeiro salvamento");
+            else setSyncStatus("ok","Realtime ativo");
             return;
           }
-          applyCloud(remote, "Realtime");
-          setSyncStatus("ok","Realtime ativo");
+          applyCloud(remote);
         }, err=>setSyncStatus("err", err&&err.message||"Realtime recusou a leitura"));
         fsDoc.onSnapshot(doc=>{
-          if(!doc.exists) return;
-          applyCloud(doc.data(), "Firestore");
+          const data=doc.exists?doc.data():null;
+          if(!rtdbSeen){
+            fsHeld=data;
+            fsHeldSeen=true;
+            return;
+          }
+          if(!data) return;
+          applyCloud(data);
         }, err=>{ /* Realtime é a fonte principal */ });
       }
-      if(!isEmptyState(state)) pushCloud();
+      if(rtdbSeen){
+        cloudHydrated=true;
+        flushQueuedPush();
+      }
     });
   }
   function sessionPayload(){
@@ -2454,8 +2611,14 @@ body.view-projects .project-switch{display:none !important}
   applyTheme(prefs.theme||"light");
   $("notifyBtn").textContent=prefs.notify?"Alertas ativos":"Ativar alertas";
   window.addEventListener("storage",ev=>{
-    if(ev.key===KEY){
-      try{ state=normalize(JSON.parse(ev.newValue||"{}")); if(role) render(); }catch(e){}
+    if(ev.key===KEY && ev.newValue){
+      try{
+        const incoming=normalize(JSON.parse(ev.newValue));
+        if(remoteWins(state, incoming) && !(lostWork(state, incoming) && !((Number(incoming.meta&&incoming.meta.rev)||0)>(Number(state.meta&&state.meta.rev)||0)))){
+          state=incoming;
+          if(role) render();
+        }
+      }catch(e){}
     }
     if(ev.key==="controle_horas_last_punch" && role==="manager" && ev.newValue){
       try{
