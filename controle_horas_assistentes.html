@@ -809,7 +809,7 @@ body.view-projects .project-switch{display:none !important}
       records=migrateLegacyKeys(records, "oportuniza");
       closures=migrateLegacyKeys(closures, "oportuniza");
     }
-    Object.keys(records).forEach(k=>{ records[k]=asArray(records[k]); });
+    Object.keys(records).forEach(k=>{ records[k]=uniqueByDate(records[k]); });
     const history=asArray(raw.history).map(h=>{
       if(typeof h.employee==="number") return Object.assign({}, h, {employee:"oportuniza-"+h.employee, projectId:"oportuniza"});
       return h;
@@ -872,6 +872,12 @@ body.view-projects .project-switch{display:none !important}
   let lastPushRev=0;
   let pushSerial=0;
   let pushChain=Promise.resolve();
+  let dirtyPunches={};
+  let applyingCloud=false;
+  let deferredCloud=null;
+  let lastPublishedSig="";
+  let lastPublishedAt=0;
+  let shielding=false;
   let rtdbRef=null;
   let fsDoc=null;
   let rtdbSeen=false;
@@ -1006,25 +1012,183 @@ body.view-projects .project-switch{display:none !important}
       showLogin();
     }
   }
+  function recordPrefer(a, b){
+    if(!a) return false;
+    if(!b) return true;
+    const au=a.updatedAt||"", bu=b.updatedAt||"";
+    if(a.source==="gestor" && au && (!bu || au>bu)) return true;
+    if(b.source==="gestor" && bu && (!au || bu>au)) return false;
+    const score=r=>(r.entry?4:0)+(r.exit?4:0)+(r.lunchStart?1:0)+(r.lunchEnd?1:0)+(r.note?1:0);
+    const ds=score(a)-score(b);
+    if(ds!==0) return ds>0;
+    if(au&&bu&&au!==bu) return au>bu;
+    if(au&&!bu) return true;
+    return false;
+  }
+  function recSig(r){
+    return [r.date,r.type||"",r.entry||"",r.exit||"",r.lunchStart||"",r.lunchEnd||"",r.note||"",r.reason||"",r.source||"",r.updatedAt||"",r.overnight?1:0].join("~");
+  }
+  function recordsSignature(records){
+    return Object.keys(records||{}).sort().map(k=>{
+      const body=uniqueByDate(records[k]).map(recSig).join(";");
+      return body?k+"="+body:"";
+    }).filter(Boolean).join("||");
+  }
+  function historyKey(h){
+    return [h.at||"",h.employee||"",h.action||"",h.date||"",h.by||""].join("|");
+  }
+  function punchKey(recKeyId, date){ return recKeyId+"|"+date; }
+  function rememberPunch(recKeyId, rec){
+    if(!rec||!rec.date) return;
+    dirtyPunches[punchKey(recKeyId, rec.date)]=JSON.parse(JSON.stringify(rec));
+  }
+  function splitRecKey(k){
+    const m=String(k||"").match(/^(.*)_(\d{4}-\d{2})$/);
+    return m?{id:m[1], ym:m[2]}:{id:String(k||""), ym:""};
+  }
+  function hasNewerDelete(snapshot, recKeyId, rec){
+    const empId=splitRecKey(recKeyId).id;
+    const at=rec&&rec.updatedAt||"";
+    return asArray(snapshot&&snapshot.history).some(h=>h&&h.action==="excluir"&&h.date===rec.date&&h.employee===empId&&String(h.at||"")>at);
+  }
+  function forgetConfirmed(snapshot){
+    Object.keys(dirtyPunches).forEach(id=>{
+      const sep=id.indexOf("|");
+      const k=id.slice(0,sep);
+      const rec=dirtyPunches[id];
+      const found=uniqueByDate((snapshot.records&&snapshot.records[k])||[]).find(r=>r.date===rec.date);
+      if(found && !recordPrefer(rec, found)) delete dirtyPunches[id];
+    });
+  }
+  function applyDirtyRecords(target){
+    Object.keys(dirtyPunches).forEach(id=>{
+      const sep=id.indexOf("|");
+      const k=id.slice(0,sep);
+      const rec=dirtyPunches[id];
+      if(!rec||!rec.date||hasNewerDelete(target, k, rec)) return;
+      target.records=target.records||{};
+      const list=uniqueByDate(target.records[k]||[]);
+      const idx=list.findIndex(r=>r.date===rec.date);
+      if(idx<0) list.push(JSON.parse(JSON.stringify(rec)));
+      else if(recordPrefer(rec, list[idx])) list[idx]=JSON.parse(JSON.stringify(rec));
+      else return;
+      target.records[k]=list;
+    });
+  }
+  function unionHistory(a, b){
+    const map={};
+    asArray(a).concat(asArray(b)).forEach(h=>{
+      if(!h) return;
+      map[historyKey(h)]=h;
+    });
+    return Object.keys(map).map(k=>map[k]).sort((x,y)=>String(y.at||"").localeCompare(String(x.at||""))).slice(0,500);
+  }
+  function unionAlerts(baseAlerts, extraAlerts, baseTime){
+    const alerts=asArray(baseAlerts).slice();
+    const ids={};
+    alerts.forEach(a=>{ if(a&&a.id) ids[a.id]=true; });
+    asArray(extraAlerts).forEach(a=>{
+      if(!a||!a.id||ids[a.id]) return;
+      if(a.at && baseTime && a.at>baseTime){ alerts.unshift(a); ids[a.id]=true; }
+    });
+    return alerts.slice(0,80);
+  }
+  function mergeSnapshot(local, remote){
+    const useRemote=remoteWins(local, remote);
+    const base=JSON.parse(JSON.stringify(useRemote?remote:local));
+    const extra=useRemote?local:remote;
+    base.records=base.records||{};
+    const extraRecords=(extra&&extra.records)||{};
+    const keys={};
+    Object.keys(base.records).forEach(k=>{ keys[k]=true; });
+    Object.keys(extraRecords).forEach(k=>{ keys[k]=true; });
+    Object.keys(keys).forEach(k=>{
+      const map={};
+      uniqueByDate(base.records[k]||[]).forEach(r=>{ map[r.date]=r; });
+      uniqueByDate(extraRecords[k]||[]).forEach(r=>{
+        const cur=map[r.date];
+        if(!cur){
+          if(!r.updatedAt||hasNewerDelete(base, k, r)) return;
+          if(useRemote){
+            const cloudAt=(remote.meta&&remote.meta.updatedAt)||"";
+            if(!(cloudAt && r.updatedAt>cloudAt)) return;
+          }
+          map[r.date]=JSON.parse(JSON.stringify(r));
+        } else if(recordPrefer(r, cur)){
+          map[r.date]=JSON.parse(JSON.stringify(r));
+        }
+      });
+      const list=Object.keys(map).sort().map(d=>map[d]);
+      if(list.length) base.records[k]=list;
+      else delete base.records[k];
+    });
+    applyDirtyRecords(base);
+    const baseTime=(useRemote?remote:local).meta&&(useRemote?remote:local).meta.updatedAt||"";
+    base.history=unionHistory(base.history, extra&&extra.history);
+    base.alerts=unionAlerts(base.alerts, extra&&extra.alerts, baseTime);
+    base.meta=Object.assign({}, base.meta);
+    const lr=Number(local.meta&&local.meta.rev)||0;
+    const rr=Number(remote.meta&&remote.meta.rev)||0;
+    base.meta.rev=Math.max(lr, rr, Number(base.meta.rev)||0);
+    const la=(local.meta&&local.meta.updatedAt)||"";
+    const ra=(remote.meta&&remote.meta.updatedAt)||"";
+    base.meta.updatedAt=la>ra?la:(ra||la);
+    return base;
+  }
+  function publishMerged(){
+    const sig=recordsSignature(state.records);
+    const nowMs=Date.now();
+    if(sig && sig===lastPublishedSig && nowMs-lastPublishedAt<2000) return;
+    lastPublishedSig=sig;
+    lastPublishedAt=nowMs;
+    persist();
+  }
+  function shieldPunches(){
+    if(shielding||!Object.keys(dirtyPunches).length) return;
+    const before=recordsSignature(state.records);
+    applyDirtyRecords(state);
+    if(recordsSignature(state.records)===before) return;
+    shielding=true;
+    try{ persist(); }
+    finally{ shielding=false; }
+  }
   function applyCloud(remote){
+    if(applyingCloud){ deferredCloud=remote; return; }
+    applyingCloud=true;
+    try{ applyCloudNow(remote); }
+    finally{
+      applyingCloud=false;
+      if(deferredCloud){
+        const next=deferredCloud;
+        deferredCloud=null;
+        applyCloud(next);
+      }
+    }
+  }
+  function applyCloudNow(remote){
     const decoded=decodeRemote(remote);
     if(!decoded){
       if(cloudHydrated && !isEmptyState(state)) pushCloud();
       return;
     }
-    const sameEcho=remote.updatedAt && remote.updatedAt===lastPushAt && (Number(remote.rev)||Number(decoded.meta.rev)||0)===(Number(state.meta&&state.meta.rev)||0);
-    if(sameEcho && !lostWork(state, decoded)) return;
-    const newer=remoteWins(state, decoded);
-    const rr=Number(decoded.meta&&decoded.meta.rev)||0;
-    const lr=Number(state.meta&&state.meta.rev)||0;
-    if(!newer || (lostWork(state, decoded) && !(rr>lr))){
-      const la=(state.meta&&state.meta.updatedAt)||"";
-      const ra=(decoded.meta&&decoded.meta.updatedAt)||"";
-      const localNewer=(lr>0&&rr>0&&lr>rr)||(la&&ra&&la>ra)||lostWork(state, decoded);
-      if(cloudHydrated && !isEmptyState(state) && localNewer) pushCloud();
+    const echoRev=(Number(remote.rev)||Number(decoded.meta&&decoded.meta.rev)||0);
+    const localRev=Number(state.meta&&state.meta.rev)||0;
+    const sameEcho=!!(remote.updatedAt && remote.updatedAt===lastPushAt && echoRev===localRev);
+    forgetConfirmed(decoded);
+    const merged=mergeSnapshot(state, decoded);
+    const localSig=recordsSignature(state.records);
+    const remoteSig=recordsSignature(decoded.records);
+    const mergedSig=recordsSignature(merged.records);
+    if(mergedSig!==localSig){
+      adoptRemote(merged, "nuvem");
+      if(mergedSig!==remoteSig) publishMerged();
       return;
     }
-    adoptRemote(decoded, "nuvem");
+    if(!sameEcho && remoteWins(state, decoded) && mergedSig===remoteSig){
+      adoptRemote(decoded, "nuvem");
+      return;
+    }
+    if(!sameEcho && mergedSig!==remoteSig && cloudHydrated && !isEmptyState(state)) pushCloud();
   }
   function pushCloud(){
     if(!cloudReady||!cloudHydrated||cloudIgnore||typeof firebase==="undefined") return;
@@ -1255,7 +1419,11 @@ body.view-projects .project-switch{display:none !important}
   }
   function uniqueByDate(list){
     const map={};
-    (list||[]).forEach(r=>{ if(r&&r.date) map[r.date]=r; });
+    asArray(list).forEach(r=>{
+      if(!r||!r.date) return;
+      const cur=map[r.date];
+      if(!cur || !recordPrefer(cur, r)) map[r.date]=r;
+    });
     return Object.keys(map).sort().map(d=>map[d]);
   }
   function intervalInfo(r, employee){
@@ -1357,7 +1525,7 @@ body.view-projects .project-switch{display:none !important}
   }
   function todayStatus(i){
     const today=localISODate(new Date());
-    const rec=(state.records[recKey(i, localISOMonth(new Date()))]||[]).find(r=>r.date===today);
+    const rec=uniqueByDate(state.records[recKey(i, localISOMonth(new Date()))]||[]).find(r=>r.date===today);
     if(!rec) return {text:"Sem ponto hoje", cls:"warn"};
     const t=recordType(rec);
     if(t!=="expediente") return {text:TYPES[t], cls:""};
@@ -1965,7 +2133,7 @@ body.view-projects .project-switch{display:none !important}
   }
   function todayRec(){
     const today=localISODate(new Date());
-    return (state.records[recKey(currentEmployee, localISOMonth(new Date()))]||[]).find(r=>r.date===today);
+    return uniqueByDate(state.records[recKey(currentEmployee, localISOMonth(new Date()))]||[]).find(r=>r.date===today);
   }
   function renderReport(){
     const proj=projectById(currentProject);
@@ -1993,6 +2161,7 @@ body.view-projects .project-switch{display:none !important}
   }
   function render(){
     if(!role) return;
+    shieldPunches();
     $("monthPicker").value=currentMonth;
     applyAuthUI();
     renderProjectSwitch();
@@ -2090,7 +2259,7 @@ body.view-projects .project-switch{display:none !important}
     const labels={entry:"entrada", exit:"saída"};
     if(field!=="entry" && (now.getDay()===0||now.getDay()===6) && !confirm("Hoje é fim de semana. Registrar mesmo assim?")) return;
     const k=recKey(currentEmployee, ym);
-    const arr=[...(state.records[k]||[])];
+    const arr=uniqueByDate(state.records[k]||[]);
     let rec=arr.find(r=>r.date===today);
     if(rec && recordType(rec)!=="expediente"){alert("O gestor já lançou este dia. Você não pode registrar ponto.");return}
     if(!rec){ rec={date:today, type:"expediente", source:"ponto"}; arr.push(rec); }
@@ -2103,6 +2272,7 @@ body.view-projects .project-switch{display:none !important}
     rec.source="ponto";
     rec.updatedAt=now.toISOString();
     state.records[k]=arr;
+    rememberPunch(k, rec);
     logChange("ponto-"+field, today, prev, rec);
     const proj=projectById(currentProject);
     const punchAlert={
@@ -2664,6 +2834,36 @@ body.view-projects .project-switch{display:none !important}
     const weekendEmp=Object.assign(defaultEmployee("Fim"), {workDays:[0,6]});
     const weekendStats=computeMonthStats(weekendEmp, [], 0, "2026-10");
     check("dias configurados de fim de semana entram na pendência", weekendStats.pending.some(d=>weekday(d)===6), "pending="+weekendStats.pending.length);
+    const dup=uniqueByDate([
+      {date:"2026-11-10", type:"expediente", entry:"08:11", updatedAt:"2026-11-10T11:11:00.000Z", source:"ponto"},
+      {date:"2026-11-10", type:"expediente", source:"ponto", updatedAt:"2026-11-10T11:12:00.000Z"}
+    ]);
+    check("duplicata vazia não esconde a batida", dup.length===1 && dup[0].entry==="08:11", JSON.stringify(dup));
+    const punchDay="2026-11-10";
+    const punchKeyId="oportuniza-0_2026-11";
+    const localPunch=normalize({meta:{rev:3,updatedAt:"2026-11-10T15:00:00.000Z"}, records:{[punchKeyId]:[{date:punchDay,type:"expediente",entry:"08:00",source:"ponto",updatedAt:"2026-11-10T15:00:00.000Z"}]}});
+    const remoteAhead=normalize({meta:{rev:10,updatedAt:"2026-11-10T14:00:00.000Z"}, records:{"cais-0_2026-11":[{date:"2026-11-03",type:"expediente",entry:"08:00",exit:"17:00",updatedAt:"2026-11-03T18:00:00.000Z"}]}});
+    const kept=mergeSnapshot(localPunch, remoteAhead);
+    const keptRec=uniqueByDate(kept.records[punchKeyId]||[]).find(r=>r.date===punchDay);
+    check("nuvem com revisão maior não apaga a batida", keptRec&&keptRec.entry==="08:00", JSON.stringify(keptRec));
+    const localAhead=normalize({meta:{rev:12,updatedAt:"2026-11-10T15:05:00.000Z"}, records:{"cais-0_2026-11":[{date:"2026-11-03",type:"expediente",entry:"08:00",exit:"17:00",updatedAt:"2026-11-03T18:00:00.000Z"}]}});
+    const remotePunch=normalize({meta:{rev:11,updatedAt:"2026-11-10T15:00:01.000Z"}, records:{[punchKeyId]:[{date:punchDay,type:"expediente",entry:"09:15",source:"ponto",updatedAt:"2026-11-10T15:00:01.000Z"}]}});
+    const pulled=mergeSnapshot(localAhead, remotePunch);
+    const pulledRec=uniqueByDate(pulled.records[punchKeyId]||[]).find(r=>r.date===punchDay);
+    check("revisão local maior não apaga batida da nuvem", pulledRec&&pulledRec.entry==="09:15", JSON.stringify(pulledRec));
+    const localDeleted=normalize({meta:{rev:12,updatedAt:"2026-11-10T15:06:00.000Z"}, records:{"cais-0_2026-11":[{date:"2026-11-03",type:"expediente",entry:"08:00",exit:"17:00",updatedAt:"2026-11-03T18:00:00.000Z"}]}, history:[{at:"2026-11-10T15:06:00.000Z", employee:"oportuniza-0", action:"excluir", date:punchDay}]});
+    const notBack=mergeSnapshot(localDeleted, remotePunch);
+    check("exclusão mais nova não ressuscita o ponto", !uniqueByDate(notBack.records[punchKeyId]||[]).some(r=>r.date===punchDay), JSON.stringify(notBack.records[punchKeyId]||[]));
+    const staleLocal=normalize({meta:{rev:2,updatedAt:"2026-10-01T12:00:00.000Z"}, records:{[punchKeyId]:[{date:"2026-10-01",type:"expediente",entry:"08:00",exit:"17:00",updatedAt:"2026-10-01T12:00:00.000Z"}]}});
+    const freshCloud=normalize({meta:{rev:20,updatedAt:"2026-11-10T16:00:00.000Z"}, records:{"cais-0_2026-11":[{date:"2026-11-03",type:"expediente",entry:"08:00",exit:"17:00",updatedAt:"2026-11-03T18:00:00.000Z"}]}});
+    const noStale=mergeSnapshot(staleLocal, freshCloud);
+    check("dia antigo local não volta por cima da nuvem", !uniqueByDate(noStale.records[punchKeyId]||[]).some(r=>r.date==="2026-10-01"), JSON.stringify(noStale.records[punchKeyId]||[]));
+    dirtyPunches[punchKeyId+"|"+punchDay]={date:punchDay, type:"expediente", entry:"10:01", source:"ponto", updatedAt:"2026-11-10T15:00:00.000Z"};
+    const justPunched=normalize({meta:{rev:4,updatedAt:"2026-11-10T15:00:00.000Z"}, records:{[punchKeyId]:[{date:punchDay,type:"expediente",entry:"10:01",source:"ponto",updatedAt:"2026-11-10T15:00:00.000Z"}]}});
+    const shielded=mergeSnapshot(justPunched, freshCloud);
+    const shieldedRec=uniqueByDate(shielded.records[punchKeyId]||[]).find(r=>r.date===punchDay);
+    check("batida desta sessão sobrevive a nuvem mais nova", shieldedRec&&shieldedRec.entry==="10:01", JSON.stringify(shieldedRec));
+    delete dirtyPunches[punchKeyId+"|"+punchDay];
     const failed=out.filter(r=>!r.pass);
     return {ok:!failed.length, total:out.length, failed:failed.length, results:out};
   }
