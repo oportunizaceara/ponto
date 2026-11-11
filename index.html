@@ -1016,14 +1016,18 @@ body.view-projects .project-switch{display:none !important}
     if(!a) return false;
     if(!b) return true;
     const au=a.updatedAt||"", bu=b.updatedAt||"";
-    if(a.source==="gestor" && au && (!bu || au>bu)) return true;
-    if(b.source==="gestor" && bu && (!au || bu>au)) return false;
+    const emptyShell=r=>r.source!=="gestor" && !r.entry && !r.exit;
+    if((au||bu) && au!==bu){
+      const aNewer=au>bu;
+      const newer=aNewer?a:b;
+      const older=aNewer?b:a;
+      if(emptyShell(newer) && (older.entry||older.exit)) return !aNewer;
+      return aNewer;
+    }
+    if(a.source==="gestor" && b.source!=="gestor") return true;
+    if(b.source==="gestor" && a.source!=="gestor") return false;
     const score=r=>(r.entry?4:0)+(r.exit?4:0)+(r.lunchStart?1:0)+(r.lunchEnd?1:0)+(r.note?1:0);
-    const ds=score(a)-score(b);
-    if(ds!==0) return ds>0;
-    if(au&&bu&&au!==bu) return au>bu;
-    if(au&&!bu) return true;
-    return false;
+    return score(a)>score(b);
   }
   function recSig(r){
     return [r.date,r.type||"",r.entry||"",r.exit||"",r.lunchStart||"",r.lunchEnd||"",r.note||"",r.reason||"",r.source||"",r.updatedAt||"",r.overnight?1:0].join("~");
@@ -1041,6 +1045,9 @@ body.view-projects .project-switch{display:none !important}
   function rememberPunch(recKeyId, rec){
     if(!rec||!rec.date) return;
     dirtyPunches[punchKey(recKeyId, rec.date)]=JSON.parse(JSON.stringify(rec));
+  }
+  function forgetPunch(recKeyId, date){
+    delete dirtyPunches[punchKey(recKeyId, date)];
   }
   function splitRecKey(k){
     const m=String(k||"").match(/^(.*)_(\d{4}-\d{2})$/);
@@ -2240,9 +2247,11 @@ body.view-projects .project-switch{display:none !important}
     if(closed) msg="Mês fechado. "+msg;
     if(!confirm(msg)) return;
     if(reason) draft.reason=reason;
+    draft.updatedAt=new Date().toISOString();
     const arr=records().filter(r=>r.date!==draft.date);
     arr.push(draft);
     state.records[key()]=arr;
+    forgetPunch(key(), draft.date);
     logChange(prev?"editar":"criar", draft.date, prev, draft, reason);
     if(!persist()) return;
     $("reasonInput").value="";
@@ -2666,6 +2675,7 @@ body.view-projects .project-switch{display:none !important}
       if(closed && (!reason||!reason.trim())){alert("Exclusão em mês fechado exige justificativa.");return}
       if(confirm("Excluir o registro de "+date.split("-").reverse().join("/")+"? O histórico da correção é mantido.")){
         state.records[key()]=records().filter(r=>r.date!==date);
+        forgetPunch(key(), date);
         logChange("excluir", date, prev, null, (reason||"").trim());
         if(!persist()) return;
         render();
@@ -2863,6 +2873,19 @@ body.view-projects .project-switch{display:none !important}
     const shielded=mergeSnapshot(justPunched, freshCloud);
     const shieldedRec=uniqueByDate(shielded.records[punchKeyId]||[]).find(r=>r.date===punchDay);
     check("batida desta sessão sobrevive a nuvem mais nova", shieldedRec&&shieldedRec.entry==="10:01", JSON.stringify(shieldedRec));
+    delete dirtyPunches[punchKeyId+"|"+punchDay];
+    const gestorEdit={date:punchDay, type:"expediente", entry:"07:30", exit:"16:30", source:"gestor", updatedAt:"2026-11-10T18:00:00.000Z"};
+    const oldPunch={date:punchDay, type:"expediente", entry:"08:00", exit:"17:00", source:"ponto", updatedAt:"2026-11-10T15:00:00.000Z"};
+    const picked=uniqueByDate([oldPunch, gestorEdit]);
+    check("correção do gestor substitui a batida", picked.length===1 && picked[0].entry==="07:30" && picked[0].exit==="16:30", JSON.stringify(picked));
+    const worked=recordWorked(picked[0], e);
+    check("cálculo usa o horário corrigido", worked===480, "w="+worked);
+    const localEdit=normalize({meta:{rev:15,updatedAt:"2026-11-10T18:00:00.000Z"}, records:{[punchKeyId]:[gestorEdit]}});
+    const remoteOld=normalize({meta:{rev:14,updatedAt:"2026-11-10T15:00:00.000Z"}, records:{[punchKeyId]:[oldPunch]}});
+    dirtyPunches[punchKeyId+"|"+punchDay]=JSON.parse(JSON.stringify(oldPunch));
+    const edited=mergeSnapshot(localEdit, remoteOld);
+    const editRec=uniqueByDate(edited.records[punchKeyId]||[]).find(r=>r.date===punchDay);
+    check("nuvem antiga não desfaz a correção do gestor", editRec&&editRec.entry==="07:30"&&editRec.exit==="16:30", JSON.stringify(editRec));
     delete dirtyPunches[punchKeyId+"|"+punchDay];
     const failed=out.filter(r=>!r.pass);
     return {ok:!failed.length, total:out.length, failed:failed.length, results:out};
